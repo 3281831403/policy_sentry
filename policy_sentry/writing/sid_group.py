@@ -18,7 +18,10 @@ from policy_sentry.querying.actions import (
     get_dependent_actions,
 )
 from policy_sentry.querying.all import get_all_actions
-from policy_sentry.querying.arns import get_resource_type_name_with_raw_arn
+from policy_sentry.querying.arns import (
+    get_arn_types_for_service,
+    get_resource_type_name_with_raw_arn,
+)
 from policy_sentry.shared.constants import POLICY_LANGUAGE_VERSION
 from policy_sentry.util.actions import get_lowercase_action_list
 from policy_sentry.util.arns import does_arn_match, get_service_from_arn, parse_arn
@@ -386,6 +389,54 @@ class SidGroup:
             raise Exception("Please provide the action as a string, not a list.")
         return self.sids
 
+    def add_action_with_foreign_resource_arn(self, action: str, raw_arn_format: str, access_level: str) -> None:
+        """
+        Add an action whose resource ARN belongs to a different service than the action itself
+        (or to a placeholder service like `${Vendor}`), scoped to the raw ARN format declared
+        in the IAM database.
+
+        This is needed because `add_by_arn_and_access_level` derives the service from the ARN.
+        For actions like `kafka-cluster:DescribeCluster` (resource ARN starts with
+        `arn:${Partition}:kafka:...`) or `backup:DescribeRecoveryPoint` (resource ARN contains
+        `${Vendor}`), that derivation points at the wrong service and the action would be
+        silently dropped from the policy. Here we keep the action under its own service and
+        scope it to the raw ARN of its declared resource type.
+
+        Arguments:
+            action: The IAM action, like `kafka-cluster:DescribeCluster`
+            raw_arn_format: The raw ARN format from the database, like `arn:${Partition}:kafka:${Region}:${Account}:cluster/${ClusterName}/${ClusterUuid}`
+            access_level: An access level as it is written in the database, such as 'Read', 'Write', 'List', 'Permissions management', or 'Tagging'
+        """
+        service_prefix = action.split(":")[0]
+        resource_type_name = None
+        for resource_name, resource_arn in get_arn_types_for_service(service_prefix).items():
+            if resource_arn.lower() == raw_arn_format.lower():
+                resource_type_name = resource_name
+                break
+        if resource_type_name is None:
+            # Defensive fallback: the raw ARN came from the service's own resource
+            # definitions, so this should not happen. Never drop the action silently.
+            logger.debug(f"Could not determine resource type name for {action} with ARN {raw_arn_format}")
+            self.add_action_without_resource_constraint(action)
+            return
+
+        sid_namespace = create_policy_sid_namespace(service_prefix, access_level, resource_type_name)
+        if sid_namespace in self.sids:
+            if raw_arn_format not in self.sids[sid_namespace]["arn"]:
+                self.sids[sid_namespace]["arn"].append(raw_arn_format)
+            if action not in self.sids[sid_namespace]["actions"]:
+                self.sids[sid_namespace]["actions"].append(action)
+        else:
+            temp_sid_dict = {
+                "arn": [raw_arn_format],
+                "service": service_prefix,
+                "access_level": access_level,
+                "arn_format": raw_arn_format,
+                "actions": [action],
+                "conditions": [],  # TODO: Add conditions
+            }
+            self.sids[sid_namespace] = temp_sid_dict
+
     def add_by_list_of_actions(self, supplied_actions: list[str]) -> dict[str, Any]:
         """
         Takes a list of actions, queries the database for corresponding arns, adds them to the object.
@@ -425,7 +476,17 @@ class SidGroup:
         actions_without_resource_constraints = []
         for item in arns_matching_supplied_actions:
             if item["resource_arn_format"] != "*":
-                self.add_by_arn_and_access_level([item["resource_arn_format"]], item["access_level"])
+                action_service_prefix = item["action"].split(":")[0]
+                arn_service_prefix = get_service_from_arn(item["resource_arn_format"])
+                if arn_service_prefix != action_service_prefix:
+                    # The resource ARN belongs to a different service (or a placeholder
+                    # like ${Vendor}). Deriving the service from the ARN would silently
+                    # drop the action, so scope it directly to its declared raw ARN.
+                    self.add_action_with_foreign_resource_arn(
+                        item["action"], item["resource_arn_format"], item["access_level"]
+                    )
+                else:
+                    self.add_by_arn_and_access_level([item["resource_arn_format"]], item["access_level"])
             else:
                 actions_without_resource_constraints.append(item["action"])
 
@@ -433,8 +494,26 @@ class SidGroup:
         # Otherwise, we get into issues where the amount of extra SIDs will balloon.
         # Also, the user has no way of knowing what those dependent actions are beforehand.
         # TODO: This is, in fact, a great opportunity to introduce conditions. But we aren't there yet.
+        # Exception: if every resource type a dependent action declares belongs to a different
+        # service, adding it with `*` resources would silently mis-scope it (the action supports
+        # resource constraints - they just live under another service's ARN namespace). Scope
+        # those to their declared raw ARNs instead of dropping them to "*".
         for dep_action in dependent_actions:
-            self.add_action_without_resource_constraint(dep_action)
+            dep_service_prefix = dep_action.split(":")[0]
+            dep_rows = get_action_data(dep_service_prefix, dep_action.split(":")[1]).get(dep_service_prefix, [])
+            dep_resource_rows = [row for row in dep_rows if row["resource_arn_format"] != "*"]
+            dep_foreign_rows = [
+                row
+                for row in dep_resource_rows
+                if get_service_from_arn(row["resource_arn_format"]) != dep_service_prefix
+            ]
+            if dep_resource_rows and len(dep_foreign_rows) == len(dep_resource_rows):
+                for row in dep_foreign_rows:
+                    self.add_action_with_foreign_resource_arn(
+                        dep_action, row["resource_arn_format"], row["access_level"]
+                    )
+            else:
+                self.add_action_without_resource_constraint(dep_action)
         # Now, because add_by_arn_and_access_level() adds all actions under an access level, we have to
         # remove all actions that do not match the supplied_actions. This is done in-place.
         logger.debug("Purging actions that do not match the requested actions and dependent actions")
@@ -635,6 +714,10 @@ class SidGroup:
         actions_under_wildcard_resources_to_nuke = []
 
         # Build a temporary list. Contains actions in MultMultNone SID (where resources = "*")
+        # Note: compare against the exact "*" string. Some legitimate raw ARN formats contain
+        # a literal "*" segment (e.g. `arn:${Partition}:${Vendor}:${Region}:*:${ResourceType}:${RecoveryPointId}`
+        # or `arn:${Partition}:dms:${Region}:${Account}:task:*`) and those are resource-constrained,
+        # not wildcard-only.
         for group in self.sids.values():
             if group["arn_format"] == "*":
                 actions_under_wildcard_resources.extend(group["actions"])
@@ -642,7 +725,7 @@ class SidGroup:
         # If the actions under the MultMultNone SID exist under other SIDs
         if actions_under_wildcard_resources:
             for group in self.sids.values():
-                if "*" not in group["arn_format"]:
+                if group["arn_format"] != "*":
                     # add it to a list of actions to nuke when they are under other SIDs
                     actions_under_wildcard_resources_to_nuke.extend(
                         action
@@ -653,7 +736,7 @@ class SidGroup:
         # If there are actions that we need to remove from SIDs outside of MultMultNone SID
         if actions_under_wildcard_resources_to_nuke:
             for group in self.sids.values():
-                if "*" in group["arn_format"]:
+                if group["arn_format"] == "*":
                     for action in actions_under_wildcard_resources_to_nuke:
                         if action in group["actions"]:
                             group["actions"].remove(action)
